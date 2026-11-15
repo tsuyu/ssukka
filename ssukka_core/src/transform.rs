@@ -364,8 +364,14 @@ pub fn transform(html: &str, symbols: &SymbolMap, config: &ObfuscationConfig) ->
         // elements into an encoded data-attribute, restored client-side.
         if let Some(scheme) = &structural_scheme {
             if !is_preserved && parent_is_safe && !processed.trim().is_empty() {
-                text.replace(&scheme.encode_text_node(&processed), ContentType::Html);
-                return Ok(());
+                // The restore script assigns `textContent`, which does not parse
+                // entities, so what travels must be the characters, not the raw
+                // source (`&#8220;` would come back as that literal text). Text with
+                // a reference we cannot decode with certainty is left in place.
+                if let Some(literal) = entities::decode_known_references(&processed) {
+                    text.replace(&scheme.encode_text_node(&literal), ContentType::Html);
+                    return Ok(());
+                }
             }
         }
 
@@ -424,6 +430,11 @@ pub fn transform(html: &str, symbols: &SymbolMap, config: &ObfuscationConfig) ->
                     rename_ids,
                 ) {
                     text.replace(&transformed, ContentType::Html);
+                } else {
+                    // Could not process the stylesheet: the earlier chunks were
+                    // already removed, so hand the buffered text back unchanged
+                    // rather than drop the whole <style>.
+                    text.replace(&css_text, ContentType::Html);
                 }
             }
             *style_buf.borrow_mut() = String::new();
@@ -465,6 +476,12 @@ pub fn transform(html: &str, symbols: &SymbolMap, config: &ObfuscationConfig) ->
                     // Non-JS (JSON, etc.): only rename class/ID references
                     let transformed = js::replace_symbols_word_boundary(&content, symbols, rename_classes, rename_ids);
                     text.replace(&transformed, ContentType::Html);
+                } else {
+                    // Non-JS data with nothing to rename (JSON-LD, speculationrules,
+                    // importmap, a `type="module"` script ...). Every earlier chunk of
+                    // this text node was removed above, so without this the whole
+                    // body is lost and the element comes out empty.
+                    text.replace(&content, ContentType::Html);
                 }
             }
             *script_buf.borrow_mut() = String::new();
@@ -681,5 +698,168 @@ mod tests {
         assert!(result.contains(r#"<meta name="robots" content="noai, noimageai">"#));
         assert!(result.contains(r#"<meta name="tdm-reservation" content="1">"#));
         assert!(result.contains(r#"<meta http-equiv="Content-Usage" content="train-ai=n">"#));
+    }
+
+    /// Every cosmetic transform on, but no class/ID renaming. The renaming branch of
+    /// the script handler happens to re-emit the body, which hid the bug below from
+    /// the default config; a deployment that keeps names stable (any page whose
+    /// CSS/JS lives in external files) runs this one.
+    fn no_rename_config() -> ObfuscationConfig {
+        ObfuscationConfig {
+            seed: Some(42),
+            rename_classes: false,
+            rename_ids: false,
+            ..Default::default()
+        }
+    }
+
+    /// The first `attr="..."` value in `html`, whatever the attribute order / tag case.
+    fn attr_value<'a>(html: &'a str, attr: &str) -> &'a str {
+        let needle = format!("{attr}=\"");
+        let start = html.find(&needle).unwrap_or_else(|| panic!("no {attr} in {html}")) + needle.len();
+        let end = html[start..].find('"').expect("closing quote") + start;
+        &html[start..end]
+    }
+
+    /// Regression (found on a live WordPress page): every `<script>` whose body is
+    /// not JavaScript lost its body, because earlier text chunks were removed and
+    /// nothing put the buffered text back. JSON-LD, speculation rules, import maps,
+    /// JSON settings and `type="module"` all came out empty.
+    #[test]
+    fn non_js_script_bodies_survive_untouched() {
+        let bodies = [
+            (
+                "application/ld+json",
+                r#"{"@context":"https://schema.org","@graph":[{"@type":"WebSite","url":"https://x.test/"}]}"#,
+            ),
+            (
+                "speculationrules",
+                "\n{\"prefetch\":[{\"source\":\"document\",\"where\":{\"and\":[{\"href_matches\":\"/*\"}]}}]}\n",
+            ),
+            (
+                "application/json",
+                "\n{\"baseUrl\":\"https://s.w.org/images/\",\"ext\":\".png\"}\n",
+            ),
+            ("importmap", r#"{"imports":{"a":"/a.js"}}"#),
+            ("module", "import { a } from '/a.js'; a();"),
+        ];
+        for (ty, body) in bodies {
+            let html = format!(r#"<html><body><script type="{ty}">{body}</script></body></html>"#);
+            let symbols = SymbolMap::new(Some(42));
+            for (label, config) in [("defaults", default_config()), ("no renaming", no_rename_config())] {
+                let result = transform(&html, &symbols, &config).unwrap();
+                assert!(result.contains(body), "{label}: type={ty} lost its body: {result}");
+            }
+        }
+    }
+
+    /// lol_html hands text to the handler in chunks whose boundaries depend on where
+    /// the text sits in the input, so a body that survives at one offset can be
+    /// lost at another (the live page lost four scripts at offsets 51-62 KB). Slide
+    /// the script across a range of offsets so the check does not hinge on luck.
+    #[test]
+    fn non_js_script_body_survives_at_every_offset() {
+        let body = "\n{\"baseUrl\":\"https://s.w.org/images/core/emoji/17.0.2/72x72/\",\"ext\":\".png\"}\n";
+        for pad in (0..9000).step_by(53) {
+            let html = format!(
+                "<html><body><div>{}</div><script type=\"application/json\">{body}</script></body></html>",
+                "x".repeat(pad)
+            );
+            let symbols = SymbolMap::new(Some(42));
+            let result = transform(&html, &symbols, &no_rename_config()).unwrap();
+            assert!(result.contains(body), "body lost with {pad} bytes of padding before it");
+        }
+    }
+
+    /// The exact block from the live page (WordPress speculation rules), which is what
+    /// first exposed the bug.
+    #[test]
+    fn wordpress_speculation_rules_block_survives() {
+        let body = concat!(
+            "
+{\"prefetch\":[{\"source\":\"document\",\"where\":{\"and\":[{\"href_matches\":\"/*\"},",
+            "{\"not\":{\"href_matches\":[\"/wp-*.php\",\"/wp-admin/*\",\"/*\\?(.+)\"]}},",
+            "{\"not\":{\"selector_matches\":\"a[rel~=\\\"nofollow\\\"]\"}}]},\"eagerness\":\"conservative\"}]}
+"
+        );
+        let html = format!("<html><body><script type=\"speculationrules\">{body}</script></body></html>");
+        let symbols = SymbolMap::new(Some(42));
+        let result = transform(&html, &symbols, &no_rename_config()).unwrap();
+        assert!(result.contains(body), "speculation rules lost: {result}");
+    }
+
+    /// A body big enough that lol_html splits it into several text chunks.
+    #[test]
+    fn large_non_js_script_body_survives() {
+        let body = format!(
+            r#"{{"items":[{}]}}"#,
+            vec![r#"{"k":"value","n":12345}"#; 4000].join(",")
+        );
+        let html = format!(r#"<html><body><script type="application/json">{body}</script></body></html>"#);
+        let symbols = SymbolMap::new(Some(42));
+        let result = transform(&html, &symbols, &no_rename_config()).unwrap();
+        assert!(result.contains(&body), "large JSON body was changed or lost");
+    }
+
+    /// Regression: a source reference (`&quot;`, `&raquo;`, `&#8220;`) was treated as
+    /// literal text, so its `&` was encoded and the page showed "&raquo;" (and an
+    /// Elementor `data-settings="{&quot;..."` became invalid JSON).
+    #[test]
+    fn existing_entities_are_not_double_encoded() {
+        let html = concat!(
+            r#"<html><body><p title="Suapan KADA &raquo;" data-settings="{&quot;k&quot;:&quot;v&quot;}">"#,
+            "Carian untuk &#8220;padi&#8221; &#8211; KADA &amp; rakan</p></body></html>"
+        );
+        for seed in 0..20u64 {
+            let config = ObfuscationConfig {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            let symbols = SymbolMap::new(Some(seed));
+            let result = transform(html, &symbols, &config).unwrap();
+            for bad in ["&#38;", "&#x26;", "&amp;raquo", "&amp;quot", "&amp;#", "&#x26;#"] {
+                assert!(!result.contains(bad), "seed {seed}: found {bad} in {result}");
+            }
+            let decoded = |s: &str| entities::decode_known_references(s).expect("decodable");
+            assert_eq!(
+                decoded(attr_value(&result, "title")),
+                "Suapan KADA \u{bb}",
+                "seed {seed}: {result}"
+            );
+            assert_eq!(
+                decoded(attr_value(&result, "data-settings")),
+                r#"{"k":"v"}"#,
+                "seed {seed}: {result}"
+            );
+        }
+    }
+
+    /// Structural mode restores text through `textContent`, which does not parse
+    /// entities: raw source references must be decoded first, and text with a
+    /// reference we cannot decode with certainty must be left in place.
+    #[test]
+    fn structural_mode_does_not_ship_raw_references() {
+        let config = ObfuscationConfig {
+            seed: Some(7),
+            structural_obfuscation: true,
+            ..Default::default()
+        };
+        let symbols = SymbolMap::new(Some(7));
+
+        let decodable = "<html><body><p>Carian &#8220;padi&#8221; &raquo; KADA</p></body></html>";
+        let out = transform(decodable, &symbols, &config).unwrap();
+        assert!(out.contains("<span data-"), "text node should be relocated: {out}");
+        assert!(
+            !out.contains("&#8220;"),
+            "raw reference must not travel to textContent: {out}"
+        );
+
+        let unknown = "<html><body><p>caf&eacute; KADA</p></body></html>";
+        let out = transform(unknown, &symbols, &config).unwrap();
+        assert!(
+            out.contains("&eacute;"),
+            "unknown reference: text stays in the page: {out}"
+        );
+        assert!(!out.contains("<span data-"), "and is not relocated: {out}");
     }
 }
