@@ -24,6 +24,13 @@ pub fn encode_entities(text: &str, rng: &mut StdRng) -> String {
             }
         }
         i += ch.len_utf8();
+        if ch == '\n' || ch == '\r' {
+            // Line breaks stay literal: the parser drops a literal newline right after
+            // `<pre>` / `<textarea>` / `<listing>` but keeps `&#10;`, and turns a literal CRLF
+            // into one LF while `&#13;` stays a CR that renders as a space in `<pre>`.
+            out.push(ch);
+            continue;
+        }
         if let Some(named) = named_entity(ch) {
             match rng.random_range(0u8..3) {
                 0 => out.push_str(named),
@@ -68,6 +75,11 @@ pub fn encode_attr_value(value: &str, rng: &mut StdRng) -> String {
             }
         }
         i += ch.len_utf8();
+        if ch == '\n' || ch == '\r' {
+            // A literal CRLF in an attribute value is one LF; `&#13;&#10;` would stay CR LF.
+            out.push(ch);
+            continue;
+        }
         match rng.random_range(0u8..3) {
             0 => out.push(ch),
             1 => encode_decimal(ch, &mut out),
@@ -198,6 +210,22 @@ fn named_entity(ch: char) -> Option<&'static str> {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// Regression: a newline written as `&#10;` right after `<textarea>` / `<pre>` is NOT dropped
+    /// by the parser (a literal one is), so every edit form gained a leading blank line.
+    #[test]
+    fn line_breaks_are_never_entity_encoded() {
+        for seed in 0..50u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let text = encode_entities("\nline one\r\nline two\rend", &mut rng);
+            assert!(text.starts_with('\n'), "seed {seed}: {text}");
+            assert!(text.contains("\r\n"), "seed {seed}: CRLF must stay literal: {text}");
+            assert!(!text.contains("&#10;") && !text.contains("&#xa;") && !text.contains("&#13;"), "{text}");
+            let attr = encode_attr_value("a\nb\r\nc", &mut rng);
+            assert!(attr.contains('\n') && attr.contains("\r\n"), "seed {seed}: {attr}");
+            assert!(!attr.contains("&#10;") && !attr.contains("&#xa;") && !attr.contains("&#13;"), "{attr}");
+        }
+    }
 
     #[test]
     fn encode_entities_roundtrip_safe() {

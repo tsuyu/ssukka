@@ -834,6 +834,33 @@ mod tests {
         }
     }
 
+    /// Regression (an edit form gained a leading blank line): the parser drops ONE literal newline
+    /// straight after `<pre>` / `<textarea>` / `<listing>`, but not `&#10;`. Line breaks must stay
+    /// literal so the parsed value is the same as for the original.
+    #[test]
+    fn newline_after_pre_and_textarea_start_tag_stays_literal() {
+        let html = "<html><body><form><textarea name=\"a\">\nfirst\r\nsecond</textarea>\
+                    <textarea name=\"b\">\n</textarea><pre>\ncode\n\nmore</pre></form></body></html>";
+        for seed in 0..20u64 {
+            let config = ObfuscationConfig { seed: Some(seed), ..no_rename_config() };
+            let out = transform(html, &SymbolMap::new(Some(seed)), &config).unwrap();
+            let lower = out.to_ascii_lowercase();
+            let mut found = 0;
+            for tag in ["<textarea", "<pre"] {
+                let mut from = 0;
+                while let Some(at) = lower[from..].find(tag) {
+                    let at = from + at;
+                    let gt = lower[at..].find('>').unwrap() + at;
+                    assert!(out[gt + 1..].starts_with('\n'), "seed {seed}: newline after {tag} start tag not literal: {out}");
+                    found += 1;
+                    from = gt;
+                }
+            }
+            assert_eq!(found, 3, "seed {seed}: {out}");
+            assert!(!out.contains("&#10;") && !out.contains("&#xa;") && !out.contains("&#13;"), "{out}");
+        }
+    }
+
     /// Structural mode restores text through `textContent`, which does not parse
     /// entities: raw source references must be decoded first, and text with a
     /// reference we cannot decode with certainty must be left in place.
