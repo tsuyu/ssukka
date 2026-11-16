@@ -176,6 +176,25 @@ pub fn transform(html: &str, symbols: &SymbolMap, config: &ObfuscationConfig) ->
     element_handlers.push(element!("*", |el| {
         let tag_lower = el.tag_name().to_ascii_lowercase();
 
+        // HTML: when an attribute is repeated the FIRST copy wins and the rest are ignored
+        // (`<input style="width:100%" style="">` is 100% wide). lol_html's set_attribute /
+        // remove_attribute act on every copy, so the loops below would end up keeping the LAST
+        // value (here: an empty style). Collapse duplicates to the first copy up front.
+        {
+            let attrs: Vec<(String, String)> = el.attributes().iter().map(|a| (a.name(), a.value())).collect();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut dups: Vec<&(String, String)> = Vec::new();
+            for a in &attrs {
+                if !seen.insert(a.0.as_str()) && !dups.iter().any(|d| d.0 == a.0) {
+                    dups.push(attrs.iter().find(|f| f.0 == a.0).unwrap());
+                }
+            }
+            for (name, first) in dups {
+                el.remove_attribute(name);
+                el.set_attribute(name, first)?;
+            }
+        }
+
         // Maintain the open-element stack (only for elements that have an end
         // tag, keeping it balanced regardless of void/self-closing elements).
         // Gives the text handler its parent tag (content scoping + whitespace drop).
@@ -858,6 +877,33 @@ mod tests {
             }
             assert_eq!(found, 3, "seed {seed}: {out}");
             assert!(!out.contains("&#10;") && !out.contains("&#xa;") && !out.contains("&#13;"), "{out}");
+        }
+    }
+
+    /// A repeated attribute keeps its FIRST value (HTML), not the last: the .6 `/ict/` page has
+    /// `<input style="width: 100%" style="">` and lost its width when the empty copy won.
+    #[test]
+    fn duplicate_attribute_keeps_the_first_value() {
+        let html = "<html><body><input type=\"button\" style=\"width: 100%\" style=\"\" class=\"a\" class=\"b\" value=\"MOHON\">\
+                    <p id=\"x\" id=\"y\">t</p></body></html>";
+        for seed in 0..20u64 {
+            for entities in [false, true] {
+                let config = ObfuscationConfig {
+                    seed: Some(seed),
+                    encode_attr_entities: entities,
+                    ..no_rename_config()
+                };
+                let out = transform(html, &SymbolMap::new(Some(seed)), &config).unwrap();
+                let lower = out.to_ascii_lowercase();
+                assert_eq!(lower.matches("style=").count(), 1, "seed {seed}: {out}");
+                assert_eq!(lower.matches("class=").count(), 1, "seed {seed}: {out}");
+                assert_eq!(lower.matches(" id=").count(), 1, "seed {seed}: {out}");
+                if !entities {
+                    assert!(out.contains("width: 100%"), "seed {seed}: first style lost: {out}");
+                    assert!(out.contains("class=\"a\"") && !out.contains("class=\"b\""), "seed {seed}: {out}");
+                    assert!(out.contains("id=\"x\"") && !out.contains("id=\"y\""), "seed {seed}: {out}");
+                }
+            }
         }
     }
 
