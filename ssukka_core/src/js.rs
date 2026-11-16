@@ -40,8 +40,13 @@ pub fn transform_js(
         result = encode_js_strings(&result, rng);
     }
 
+    // Keep the minified form only if it is provably the same program (and the
+    // input parses at all); otherwise the script goes out unminified.
     if minify {
-        result = minify_js(&result);
+        let minified = minify_js(&result);
+        if crate::js_ast::same_program(&result, &minified) {
+            result = minified;
+        }
     }
 
     result
@@ -328,140 +333,283 @@ fn encode_js_strings(js: &str, rng: &mut StdRng) -> String {
     out
 }
 
-/// Basic JS minification: strip comments, collapse whitespace.
+/// Separator owed between the last emitted token and the next one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Gap {
+    None,
+    Space,
+    Newline,
+}
+
+/// Conservative JS minification: strip comments and collapse whitespace, but
+/// keep every line break that separated two tokens.
 ///
-/// Intentionally simple: no full AST parse.
+/// Line breaks carry meaning in JS (automatic semicolon insertion, `return` /
+/// `throw` / `break` / postfix `++` before a newline), so a run of whitespace or
+/// a comment that contained one becomes a single `\n`; other runs become one
+/// space only where two tokens would otherwise merge. String literals, template
+/// literals (including nested `${}` expressions) and regular-expression
+/// literals are copied verbatim. Legal comments (`/*!`) and `/*@` comments are
+/// kept.
+///
+/// There is no AST here: [`transform_js`] re-parses the input and the output
+/// and keeps the original whenever they are not the same program.
 fn minify_js(js: &str) -> String {
     let chars: Vec<char> = js.chars().collect();
     let len = chars.len();
     let mut out = String::with_capacity(len);
+    let mut gap = Gap::None;
+    // One entry per `${` of an enclosing template literal: the `{` depth opened
+    // inside that substitution, so its closing `}` resumes the template.
+    let mut tmpl: Vec<usize> = Vec::new();
     let mut i = 0;
-    let mut state = State::Normal;
-    let mut prev_was_space = false;
-    let mut prev_char: Option<char> = None;
 
     while i < len {
-        match state {
-            State::Normal => {
-                if i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
-                    state = State::SingleLineComment;
-                    i += 2;
-                    continue;
-                } else if i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
-                    state = State::MultiLineComment;
-                    i += 2;
-                    continue;
-                } else if chars[i] == '\'' {
-                    prev_was_space = false;
-                    out.push(chars[i]);
-                    state = State::SingleQuoteString;
-                    prev_char = Some(chars[i]);
-                    i += 1;
-                } else if chars[i] == '"' {
-                    prev_was_space = false;
-                    out.push(chars[i]);
-                    state = State::DoubleQuoteString;
-                    prev_char = Some(chars[i]);
-                    i += 1;
-                } else if chars[i] == '`' {
-                    prev_was_space = false;
-                    out.push(chars[i]);
-                    state = State::TemplateString;
-                    prev_char = Some(chars[i]);
-                    i += 1;
-                } else if chars[i].is_ascii_whitespace() {
-                    // Collapse whitespace but keep one space between identifiers/keywords
-                    if !prev_was_space && needs_space_separator(prev_char, chars.get(i + 1).copied()) {
-                        out.push(' ');
-                    }
-                    prev_was_space = true;
-                    i += 1;
-                } else {
-                    prev_was_space = false;
-                    out.push(chars[i]);
-                    prev_char = Some(chars[i]);
-                    i += 1;
-                }
-            },
-            State::SingleLineComment => {
-                if chars[i] == '\n' {
-                    state = State::Normal;
+        let c = chars[i];
+
+        // Whitespace (ASCII only; anything else is copied as a token char).
+        if c == '\n' || c == '\r' {
+            gap = Gap::Newline;
+            i += 1;
+            continue;
+        }
+        if c == ' ' || c == '\t' || c == '\u{000B}' || c == '\u{000C}' {
+            if gap == Gap::None {
+                gap = Gap::Space;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Comments. At a token start `//` and `/*` are always comments: a regex
+        // can be neither empty nor start with `*`.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            // Leave the line terminator for the whitespace branch above.
+            i += 2;
+            while i < len && chars[i] != '\n' && chars[i] != '\r' {
+                i += 1;
+            }
+            if gap == Gap::None {
+                gap = Gap::Space;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let start = i;
+            let keep = matches!(chars.get(i + 2), Some('!') | Some('@'));
+            i += 2;
+            let mut newline = false;
+            while i < len && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                if chars[i] == '\n' || chars[i] == '\r' {
+                    newline = true;
                 }
                 i += 1;
-            },
-            State::MultiLineComment => {
-                if chars[i] == '*' && i + 1 < len && chars[i + 1] == '/' {
-                    i += 2;
-                    state = State::Normal;
-                } else {
-                    i += 1;
-                }
-            },
-            State::SingleQuoteString | State::DoubleQuoteString | State::TemplateString => {
-                let quote = match state {
-                    State::SingleQuoteString => '\'',
-                    State::DoubleQuoteString => '"',
-                    State::TemplateString => '`',
-                    _ => unreachable!(),
-                };
-                out.push(chars[i]);
-                if chars[i] == '\\' && i + 1 < len {
-                    let next = chars[i + 1];
-                    out.push(next);
-                    prev_char = Some(next);
-                    i += 2;
-                    if next == 'u' {
-                        if i < len && chars[i] == '{' {
-                            while i < len {
-                                out.push(chars[i]);
-                                prev_char = Some(chars[i]);
-                                if chars[i] == '}' {
-                                    i += 1;
-                                    break;
-                                }
-                                i += 1;
-                            }
-                        } else {
-                            for _ in 0..4 {
-                                if i < len {
-                                    out.push(chars[i]);
-                                    prev_char = Some(chars[i]);
-                                    i += 1;
-                                }
-                            }
-                        }
-                    } else if next == 'x' {
-                        for _ in 0..2 {
-                            if i < len {
-                                out.push(chars[i]);
-                                prev_char = Some(chars[i]);
-                                i += 1;
-                            }
-                        }
+            }
+            if i >= len {
+                // Unterminated: the input is broken; copy the rest untouched.
+                flush_gap(&mut out, &mut gap, c);
+                out.extend(&chars[start..]);
+                break;
+            }
+            i += 2;
+            if keep {
+                flush_gap(&mut out, &mut gap, c);
+                out.extend(&chars[start..i]);
+                continue;
+            }
+            if newline {
+                gap = Gap::Newline;
+            } else if gap == Gap::None {
+                gap = Gap::Space;
+            }
+            continue;
+        }
+
+        // String literals.
+        if c == '\'' || c == '"' {
+            flush_gap(&mut out, &mut gap, c);
+            out.push(c);
+            i += 1;
+            while i < len {
+                let d = chars[i];
+                out.push(d);
+                i += 1;
+                if d == '\\' {
+                    if i < len {
+                        out.push(chars[i]);
+                        i += 1;
                     }
-                } else if chars[i] == quote {
-                    prev_char = Some(chars[i]);
-                    i += 1;
-                    state = State::Normal;
-                } else {
-                    prev_char = Some(chars[i]);
-                    i += 1;
+                } else if d == c || d == '\n' || d == '\r' {
+                    break;
                 }
-            },
+            }
+            continue;
+        }
+
+        // Template literals.
+        if c == '`' {
+            flush_gap(&mut out, &mut gap, c);
+            out.push(c);
+            i += 1;
+            if copy_template_body(&chars, &mut i, &mut out) {
+                tmpl.push(0);
+            }
+            continue;
+        }
+
+        // Regular-expression literal (copied verbatim) or a division operator.
+        if c == '/' && regex_allowed(&out) {
+            if let Some(end) = scan_regex(&chars, i) {
+                flush_gap(&mut out, &mut gap, c);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+        }
+
+        // Any other token character.
+        flush_gap(&mut out, &mut gap, c);
+        out.push(c);
+        i += 1;
+        if let Some(depth) = tmpl.last_mut() {
+            if c == '{' {
+                *depth += 1;
+            } else if c == '}' {
+                if *depth == 0 {
+                    // This `}` closes a `${`: back inside the template literal.
+                    tmpl.pop();
+                    if copy_template_body(&chars, &mut i, &mut out) {
+                        tmpl.push(0);
+                    }
+                } else {
+                    *depth -= 1;
+                }
+            }
         }
     }
 
     out
 }
 
-/// Determine if a space is needed between two characters to avoid merging tokens.
-fn needs_space_separator(prev: Option<char>, next: Option<char>) -> bool {
-    match (prev, next) {
-        (Some(p), Some(n)) => {
-            (p.is_ascii_alphanumeric() || p == '_' || p == '$') && (n.is_ascii_alphanumeric() || n == '_' || n == '$')
+/// Emit the separator owed before a token starting with `next`.
+fn flush_gap(out: &mut String, gap: &mut Gap, next: char) {
+    match *gap {
+        Gap::None => {},
+        Gap::Newline => {
+            if !out.is_empty() {
+                out.push('\n');
+            }
         },
-        _ => false,
+        Gap::Space => {
+            if needs_space(out.chars().next_back(), next) {
+                out.push(' ');
+            }
+        },
     }
+    *gap = Gap::None;
+}
+
+/// Copy template-literal text verbatim from `*i` (just past a backtick or a
+/// substitution's closing `}`) up to the closing backtick, or up to and
+/// including a `${`. Returns `true` if it stopped at a `${`.
+fn copy_template_body(chars: &[char], i: &mut usize, out: &mut String) -> bool {
+    while *i < chars.len() {
+        let d = chars[*i];
+        out.push(d);
+        *i += 1;
+        if d == '\\' {
+            if *i < chars.len() {
+                out.push(chars[*i]);
+                *i += 1;
+            }
+        } else if d == '`' {
+            return false;
+        } else if d == '$' && chars.get(*i) == Some(&'{') {
+            out.push('{');
+            *i += 1;
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a `/` after the output so far starts a regular expression rather
+/// than a division. A wrong "regex" guess is harmless (the span is copied
+/// verbatim); a wrong "division" guess is caught by the program check.
+fn regex_allowed(out: &str) -> bool {
+    let Some(last) = out.chars().next_back() else {
+        return true;
+    };
+    if is_ident_char(last) {
+        let word: String = {
+            let mut w: Vec<char> = out.chars().rev().take_while(|&ch| is_ident_char(ch)).collect();
+            w.reverse();
+            w.into_iter().collect()
+        };
+        return matches!(
+            word.as_str(),
+            "return"
+                | "typeof"
+                | "instanceof"
+                | "in"
+                | "of"
+                | "new"
+                | "delete"
+                | "void"
+                | "throw"
+                | "case"
+                | "do"
+                | "else"
+                | "yield"
+                | "await"
+        );
+    }
+    !matches!(last, ')' | ']' | '}' | '\'' | '"' | '`')
+}
+
+/// End index (exclusive, flags included) of a regex literal starting at the
+/// `/` at `start`, or `None` if none closes on this line.
+fn scan_regex(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    let mut in_class = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\n' | '\r' => return None,
+            '\\' => i += 1,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => {
+                i += 1;
+                while i < chars.len() && is_ident_char(chars[i]) {
+                    i += 1;
+                }
+                return Some(i);
+            },
+            _ => {},
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Identifier (or number) character: two of these must not touch.
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$' || c == '\\' || (!c.is_ascii() && !c.is_whitespace())
+}
+
+/// Whether dropping the whitespace between `prev` and a token starting with
+/// `next` would merge two tokens into a different one.
+fn needs_space(prev: Option<char>, next: char) -> bool {
+    let Some(p) = prev else {
+        return false;
+    };
+    (is_ident_char(p) && is_ident_char(next))
+        || (p == '+' && next == '+')
+        || (p == '-' && next == '-')
+        || (p == '/' && (next == '/' || next == '*'))
+        || (p.is_ascii_digit() && next == '.')
+        || (p == '<' && next == '!')
+        || (p == '-' && next == '>')
 }
 
 /// Scan JS for class/ID references in DOM APIs (`getElementById`,
@@ -775,6 +923,87 @@ mod tests {
         let input = r#"var x = "  spaces  ";"#;
         let result = minify_js(input);
         assert!(result.contains("  spaces  "));
+    }
+
+    /// Minify through the public path (with the same-program check) and assert
+    /// the output is still the same program.
+    fn min_checked(js: &str) -> String {
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(1);
+        let out = transform_js(js, &SymbolMap::new(Some(1)), JsStringEncoding::None, true, false, false, &mut rng);
+        assert!(crate::js_ast::same_program(js, &out), "not the same program:\n{js}\n---\n{out}");
+        out
+    }
+
+    #[test]
+    fn minify_keeps_line_break_between_statements() {
+        // Regression: a real WordPress (ea11y) script. Dropping the newline after
+        // the arrow-function body produced `}document...`, a SyntaxError.
+        let input = "const onSkipLinkClick = () => {\n  const h = document.querySelector('html');\n  h.style['scroll-behavior'] = 'smooth';\n}\ndocument.addEventListener(\"DOMContentLoaded\", () => {\n  if (!document.querySelector('#content')) { document.querySelector('.ea11y-skip-to-content-link').remove(); }\n});";
+        let out = minify_js(input);
+        assert!(out.contains("}\ndocument.addEventListener"), "{out}");
+        assert!(!out.contains("  "), "indentation not removed: {out}");
+        min_checked(input);
+    }
+
+    #[test]
+    fn minify_keeps_return_newline() {
+        // `return\nx` returns undefined; `return x` would change behaviour.
+        let input = "function f(){\n  return\n  x;\n}";
+        let out = minify_js(input);
+        assert!(out.contains("return\nx"), "{out}");
+        assert!(!crate::js_ast::same_program(input, "function f(){return x;}"));
+    }
+
+    #[test]
+    fn minify_line_comment_keeps_separator() {
+        let input = "x = 1 // one\ny = 2";
+        assert_eq!(minify_js(input), "x=1\ny=2");
+        let input = "a /* c */ b";
+        assert_eq!(minify_js(input), "a b");
+        let input = "a = 1 /* line\nbreak */ b = 2";
+        assert_eq!(minify_js(input), "a=1\nb=2");
+    }
+
+    #[test]
+    fn minify_copies_regex_literals_verbatim() {
+        let input = "var r = s.replace(/\\/\\//g, ''), q = /'  [/]  \"/i;\nvar t = a / b / c;";
+        let out = minify_js(input);
+        assert!(out.contains("/\\/\\//g"), "{out}");
+        assert!(out.contains("/'  [/]  \"/i"), "{out}");
+        assert!(out.contains("var t=a/b/c;"), "{out}");
+        min_checked(input);
+    }
+
+    #[test]
+    fn minify_keeps_operator_spacing() {
+        assert_eq!(minify_js("a + +b; c - -d; e + ++f"), "a+ +b;c- -d;e+ ++f");
+        assert_eq!(minify_js("x = y / /re/.source.length"), "x=y/ /re/.source.length");
+        assert_eq!(minify_js("1 .toString()"), "1 .toString()");
+        assert_eq!(minify_js("var é = 1"), "var é=1");
+    }
+
+    #[test]
+    fn minify_nested_template_literals() {
+        let input = "var s = `a  ${ x ? `b  ${ {k:1}.k }  c` : d }  e`;";
+        let out = minify_js(input);
+        assert!(out.contains("`a  ${x?`b  ${{k:1}.k}  c`:d}  e`"), "{out}");
+        min_checked(input);
+    }
+
+    #[test]
+    fn minify_keeps_legal_comments() {
+        let out = minify_js("/*! (c) Vendor */\nvar a = 1;");
+        assert!(out.starts_with("/*! (c) Vendor */"), "{out}");
+    }
+
+    #[test]
+    fn minify_falls_back_when_input_does_not_parse() {
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(1);
+        let broken = "var a = ;   // broken\n  var b = 2;";
+        let out = transform_js(broken, &SymbolMap::new(Some(1)), JsStringEncoding::None, true, false, false, &mut rng);
+        assert_eq!(out, broken);
     }
 
     #[test]

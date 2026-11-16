@@ -136,6 +136,35 @@ fn mangle_and_print(js: &str, config: &ObfuscationConfig) -> Option<String> {
     None
 }
 
+/// Whether `a` and `b` are the same program once comments and formatting are
+/// ignored: `b` parses under the source type `a` parses under, and both print
+/// identically with the minifying codegen (comments off). `false` when `a`
+/// itself does not parse, since there is then nothing to compare against.
+///
+/// The token-based minifier in [`crate::js`] only removes comments and
+/// whitespace, so its output must be this same program; this check keeps the
+/// original whenever it is not (a lexing mistake, or a line break that mattered
+/// for automatic semicolon insertion, such as `return` followed by a newline).
+pub(crate) fn same_program(a: &str, b: &str) -> bool {
+    for source_type in [SourceType::cjs(), SourceType::mjs()] {
+        if let Some(ca) = canonical(a, source_type) {
+            return canonical(b, source_type).is_some_and(|cb| cb == ca);
+        }
+    }
+    false
+}
+
+/// Parse `js` and print it canonically (minified, no comments); `None` if it
+/// does not parse cleanly.
+fn canonical(js: &str, source_type: SourceType) -> Option<String> {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, js, source_type).parse();
+    if ret.panicked || !ret.diagnostics.is_empty() {
+        return None;
+    }
+    Some(Codegen::new().with_options(CodegenOptions::minify()).build(&ret.program).code)
+}
+
 /// Validate that `js` parses cleanly under either source type.
 fn parses_ok(js: &str) -> bool {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
